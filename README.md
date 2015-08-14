@@ -1,7 +1,7 @@
 Slick
 =====
 
-[![Build Status](https://travis-ci.org/slick/slick.png?branch=master)](https://travis-ci.org/slick/slick) [![Stories in Ready](https://badge.waffle.io/slick/slick.png?label=1%20-%20Ready)](https://waffle.io/slick/slick)
+[![Build Status](https://travis-ci.org/slick/slick.png?branch=master)](https://travis-ci.org/slick/slick) [![Stories in Ready](https://badge.waffle.io/slick/slick.png?label=1%20-%20Ready)](https://waffle.io/slick/slick) [![Gitter](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/slick/slick?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
 
 Slick is a modern database query and access library for Scala. It allows you
 to work with stored data almost as if you were using Scala collections while
@@ -16,7 +16,6 @@ The following database systems are directly supported for type-safe queries:
 - Derby/JavaDB
 - H2
 - HSQLDB/HyperSQL
-- Microsoft Access
 - MySQL
 - PostgreSQL
 - SQLite

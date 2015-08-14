@@ -1,56 +1,56 @@
 package com.typesafe.slick.testkit.tests
 
-import org.junit.Assert._
-import com.typesafe.slick.testkit.util.{RelationalTestDB, TestkitTest}
+import com.typesafe.slick.testkit.util.{RelationalTestDB, AsyncTest}
 
-class PagingTest extends TestkitTest[RelationalTestDB] {
-  import tdb.profile.simple._
-
-  override val reuseInstance = true
+class PagingTest extends AsyncTest[RelationalTestDB] {
+  import tdb.profile.api._
 
   class IDs(tag: Tag, name: String) extends Table[Int](tag, name) {
     def id = column[Int]("id", O.PrimaryKey)
     def * = id
   }
 
-  def testRawPagination {
+  def testRawPagination = {
     lazy val ids = TableQuery(new IDs(_, "ids_raw"))
-    ids.ddl.create;
-    ids ++= (1 to 10)
-
     val q1 = ids.sortBy(_.id)
-    assertEquals((1 to 10).toList, q1.run)
-
     val q2 = q1 take 5
-    assertEquals((1 to 5).toList, q2.run)
-
-    ifCap(rcap.pagingDrop) {
-      val q3 = q1 drop 5
-      assertEquals((6 to 10).toList, q3.run)
-
-      val q4 = q1 drop 5 take 3
-      assertEquals((6 to 8).toList, q4.run)
-
-      val q5 = q1 take 5 drop 3
-      assertEquals((4 to 5).toList, q5.run)
-    }
-
+    def q3 = q1 drop 5
+    def q4 = q1 drop 5 take 3
+    val q4b = q1.drop(5).take(3).sortBy(_.id)
+    def q5 = q1 take 5 drop 3
     val q6 = q1 take 0
-    assertEquals(List(), q6.run)
+    val q7 = ids.filter(_.id > 3).sortBy(_.id).take(3)
+
+    for {
+      _ <- ids.schema.create
+      _ <- ids ++= (1 to 10)
+      _ <- mark("q1", q1.result).map(_ shouldBe (1 to 10).toList)
+      _ <- mark("q2", q2.result).map(_ shouldBe (1 to 5).toList)
+      _ <- ifCap(rcap.pagingDrop)(for {
+        _ <- mark("q3", q3.result).map(_ shouldBe (6 to 10).toList)
+        _ <- mark("q4", q4.result).map(_ shouldBe (6 to 8).toList)
+        _ <- mark("q4b", q4b.result).map(_ shouldBe (6 to 8).toList)
+        _ <- mark("q5", q5.result).map(_ shouldBe (4 to 5).toList)
+      } yield ())
+      _ <- mark("q6", q6.result).map(_ shouldBe Nil)
+      _ <- mark("q7", q7.result).map(_ shouldBe List(4, 5, 6))
+    } yield ()
   }
 
-  def testCompiledPagination {
+  def testCompiledPagination = {
     lazy val ids = TableQuery(new IDs(_, "ids_compiled"))
-    ids.ddl.create
-    ids ++= (1 to 10)
     val q = Compiled { (offset: ConstColumn[Long], fetch: ConstColumn[Long]) =>
       ids.sortBy(_.id).drop(offset).take(fetch)
     }
-    assertEquals((1 to 5).toList, q(0, 5).run)
-    ifCap(rcap.pagingDrop) {
-      assertEquals((6 to 10).toList, q(5, 1000).run)
-      assertEquals((6 to 8).toList, q(5, 3).run)
-    }
-    assertEquals(List(), q(0, 0).run)
+    seq(
+      ids.schema.create,
+      ids ++= (1 to 10),
+      q(0, 5).result.map(_ shouldBe (1 to 5).toList),
+      ifCap(rcap.pagingDrop)(seq(
+        q(5, 1000).result.map(_ shouldBe (6 to 10).toList),
+        q(5, 3).result.map(_ shouldBe (6 to 8).toList)
+      )),
+      q(0, 0).result.map(_ shouldBe Nil)
+    )
   }
 }

@@ -2,16 +2,22 @@ package com.typesafe.slick.testkit.util
 
 import java.io._
 import java.net.{URL, URLClassLoader}
-import java.sql.Driver
+import java.sql.{Connection, Driver}
 import java.util.Properties
+import java.util.concurrent.ExecutionException
 import java.util.zip.GZIPInputStream
 import scala.collection.mutable
-import scala.slick.jdbc.{StaticQuery => Q, ResultSetInvoker}
-import scala.slick.jdbc.GetResult._
-import scala.slick.driver._
-import scala.slick.profile.{SqlDriver, RelationalDriver, BasicDriver, Capability}
+import scala.concurrent.{Await, Future, ExecutionContext}
+import slick.SlickException
+import slick.dbio.{NoStream, DBIOAction, DBIO}
+import slick.jdbc.{ResultSetAction, JdbcDataSource, SimpleJdbcAction}
+import slick.jdbc.GetResult._
+import slick.driver._
+import slick.profile.{SqlDriver, RelationalDriver, BasicDriver, Capability}
 import org.junit.Assert
 import com.typesafe.config.Config
+
+import slick.util.AsyncExecutor
 
 object TestDB {
   object capabilities {
@@ -25,8 +31,10 @@ object TestDB {
     val jdbcMetaGetFunctions = new Capability("test.jdbcMetaGetFunctions")
     /** Supports JDBC metadata getIndexInfo method */
     val jdbcMetaGetIndexInfo = new Capability("test.jdbcMetaGetIndexInfo")
+    /** Supports all tested transaction isolation levels */
+    val transactionIsolation = new Capability("test.transactionIsolation")
 
-    val all = Set(plainSql, jdbcMeta, jdbcMetaGetClientInfoProperties, jdbcMetaGetFunctions, jdbcMetaGetIndexInfo)
+    val all = Set(plainSql, jdbcMeta, jdbcMetaGetClientInfoProperties, jdbcMetaGetFunctions, jdbcMetaGetIndexInfo, transactionIsolation)
   }
 
   /** Copy a file, expanding it if the source name ends with .gz */
@@ -124,60 +132,83 @@ trait TestDB {
   def confOptionalString(path: String) = if(config.hasPath(path)) Some(config.getString(path)) else None
   def confString(path: String) = confOptionalString(path).getOrElse(null)
   def confStrings(path: String) = TestkitConfig.getStrings(config, path).getOrElse(Nil)
+
+  /** The tests to run for this configuration. */
+  def testClasses: Seq[Class[_ <: GenericTest[_ >: Null <: TestDB]]] = TestkitConfig.testClasses
 }
 
 trait RelationalTestDB extends TestDB {
   type Driver <: RelationalDriver
 
-  def assertTablesExist(tables: String*)(implicit session: profile.Backend#Session): Unit
-  def assertNotTablesExist(tables: String*)(implicit session: profile.Backend#Session): Unit
+  def assertTablesExist(tables: String*): DBIO[Unit]
+  def assertNotTablesExist(tables: String*): DBIO[Unit]
 }
 
 trait SqlTestDB extends RelationalTestDB { type Driver <: SqlDriver }
 
 abstract class JdbcTestDB(val confName: String) extends SqlTestDB {
+  import driver.api.actionBasedSQLInterpolation
+
   type Driver = JdbcDriver
   lazy val database = profile.backend.Database
   val jdbcDriver: String
-  def getLocalTables(implicit session: profile.Backend#Session) = {
-    val tables = ResultSetInvoker[(String,String,String, String)](_.conn.getMetaData().getTables("", "", null, null))
-    tables.list.filter(_._4.toUpperCase == "TABLE").map(_._3).sorted
-  }
-  def getLocalSequences(implicit session: profile.Backend#Session) = {
-    val tables = ResultSetInvoker[(String,String,String, String)](_.conn.getMetaData().getTables("", "", null, null))
-    tables.list.filter(_._4.toUpperCase == "SEQUENCE").map(_._3).sorted
-  }
-  def dropUserArtifacts(implicit session: profile.Backend#Session) = {
-    for(t <- getLocalTables)
-      (Q.u+"drop table if exists "+driver.quoteIdentifier(t)+" cascade").execute
-    for(t <- getLocalSequences)
-      (Q.u+"drop sequence if exists "+driver.quoteIdentifier(t)+" cascade").execute
-  }
-  def assertTablesExist(tables: String*)(implicit session: profile.Backend#Session) {
-    for(t <- tables) {
-      try ((Q[Int]+"select 1 from "+driver.quoteIdentifier(t)+" where 1 < 0").list) catch { case _: Exception =>
-        Assert.fail("Table "+t+" should exist")
-      }
-    }
-  }
-  def assertNotTablesExist(tables: String*)(implicit session: profile.Backend#Session) {
-    for(t <- tables) {
-      try {
-        (Q[Int]+"select 1 from "+driver.quoteIdentifier(t)+" where 1 < 0").list
-        Assert.fail("Table "+t+" should not exist")
-      } catch { case _: Exception => }
-    }
-  }
+  final def getLocalTables(implicit session: profile.Backend#Session) = blockingRunOnSession(ec => localTables(ec))
+  final def getLocalSequences(implicit session: profile.Backend#Session) = blockingRunOnSession(ec => localSequences(ec))
   def canGetLocalTables = true
+  def localTables(implicit ec: ExecutionContext): DBIO[Vector[String]] =
+    ResultSetAction[(String,String,String, String)](_.conn.getMetaData().getTables("", "", null, null)).map { ts =>
+      ts.filter(_._4.toUpperCase == "TABLE").map(_._3).sorted
+    }
+  def localSequences(implicit ec: ExecutionContext): DBIO[Vector[String]] =
+    ResultSetAction[(String,String,String, String)](_.conn.getMetaData().getTables("", "", null, null)).map { ts =>
+      ts.filter(_._4.toUpperCase == "SEQUENCE").map(_._3).sorted
+    }
+  def dropUserArtifacts(implicit session: profile.Backend#Session) = blockingRunOnSession { implicit ec =>
+    for {
+      tables <- localTables
+      sequences <- localSequences
+      _ <- DBIO.seq((tables.map(t => sqlu"""drop table if exists #${driver.quoteIdentifier(t)} cascade""") ++
+        sequences.map(t => sqlu"""drop sequence if exists #${driver.quoteIdentifier(t)} cascade""")): _*)
+    } yield ()
+  }
+  def assertTablesExist(tables: String*) =
+    DBIO.seq(tables.map(t => sql"""select 1 from #${driver.quoteIdentifier(t)} where 1 < 0""".as[Int]): _*)
+  def assertNotTablesExist(tables: String*) =
+    DBIO.seq(tables.map(t => sql"""select 1 from #${driver.quoteIdentifier(t)} where 1 < 0""".as[Int].failed): _*)
+  def createSingleSessionDatabase(implicit session: profile.Backend#Session, executor: AsyncExecutor = AsyncExecutor.default()): profile.Backend#Database = {
+    val wrappedConn = new DelegateConnection(session.conn) {
+      override def close(): Unit = ()
+    }
+    profile.backend.Database.forSource(new JdbcDataSource {
+      def createConnection(): Connection = wrappedConn
+      def close(): Unit = ()
+    }, executor)
+  }
+  final def blockingRunOnSession[R](f: ExecutionContext => DBIOAction[R, NoStream, Nothing])(implicit session: profile.Backend#Session): R = {
+    val ec = new ExecutionContext {
+      def execute(runnable: Runnable): Unit = runnable.run()
+      def reportFailure(t: Throwable): Unit = throw t
+    }
+    val db = createSingleSessionDatabase(session, new AsyncExecutor {
+      def executionContext: ExecutionContext = ec
+      def close(): Unit = ()
+    })
+    db.run(f(ec)).value.get.get
+  }
+  protected[this] def await[T](f: Future[T]): T =
+    try Await.result(f, TestkitConfig.asyncTimeout)
+    catch { case ex: ExecutionException => throw ex.getCause }
 }
 
-abstract class InternalJdbcTestDB(confName: String) extends JdbcTestDB(confName) {
+abstract class InternalJdbcTestDB(confName: String) extends JdbcTestDB(confName) { self =>
   val url: String
   def createDB(): profile.Backend#Database = database.forURL(url, driver = jdbcDriver)
   override def toString = url
 }
 
 abstract class ExternalJdbcTestDB(confName: String) extends JdbcTestDB(confName) {
+  import driver.api.actionBasedSQLInterpolation
+
   val jdbcDriver = confString("driver")
   val testDB = confString("testDB")
 
@@ -189,6 +220,11 @@ abstract class ExternalJdbcTestDB(confName: String) extends JdbcTestDB(confName)
 
   override def isEnabled = super.isEnabled && config.getBoolean("enabled")
 
+  override lazy val testClasses: Seq[Class[_ <: GenericTest[_ >: Null <: TestDB]]] =
+    TestkitConfig.getStrings(config, "testClasses")
+      .map(_.map(n => Class.forName(n).asInstanceOf[Class[_ <: GenericTest[_ >: Null <: TestDB]]]))
+      .getOrElse(super.testClasses)
+
   def databaseFor(path: String) = database.forConfig(path, config, loadCustomDriver().getOrElse(null))
 
   override def createDB() = databaseFor("testConn")
@@ -196,24 +232,23 @@ abstract class ExternalJdbcTestDB(confName: String) extends JdbcTestDB(confName)
   override def cleanUpBefore() {
     if(!drop.isEmpty || !create.isEmpty) {
       println("[Creating test database "+this+"]")
-      databaseFor("adminConn") withSession { implicit session =>
-        for(s <- drop) (Q.u + s).execute
-        for(s <- create) (Q.u + s).execute
-      }
+      await(databaseFor("adminConn").run(
+        DBIO.seq((drop ++ create).map(s => sqlu"#$s"): _*).withPinnedSession
+      ))
     }
     if(!postCreate.isEmpty) {
-      createDB() withSession { implicit session  =>
-        for(s <- postCreate) (Q.u + s).execute
-      }
+      await(createDB().run(
+        DBIO.seq(postCreate.map(s => sqlu"#$s"): _*).withPinnedSession
+      ))
     }
   }
 
   override def cleanUpAfter() {
     if(!drop.isEmpty) {
       println("[Dropping test database "+this+"]")
-      databaseFor("adminConn") withSession { implicit session =>
-        for(s <- drop) (Q.u + s).execute
-      }
+      await(databaseFor("adminConn").run(
+        DBIO.seq(drop.map(s => sqlu"#$s"): _*).withPinnedSession
+      ))
     }
   }
 
